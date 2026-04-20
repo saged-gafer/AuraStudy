@@ -8,16 +8,12 @@ export default {
   theme: {
     extend: {
       colors: {
-        aura: {
-          purple: '#A78BFA',
-          blue: '#60A5FA',
-          pink: '#F472B6',
-          lavender: '#E9D5FF',
+        flow: {
+          indigo: '#6366f1',
+          slate: '#0f172a',
+          accent: '#818cf8',
         }
       },
-      backdropBlur: {
-        xs: '2px',
-      }
     },
   },
   plugins: [],
