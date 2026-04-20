@@ -29,9 +29,37 @@ const firebaseConfig = {
   appId: "1:123456789:web:abcdef"
 };
 
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-const db = getFirestore(app);
+const isMockEnabled = firebaseConfig.apiKey === "YOUR_API_KEY" || !firebaseConfig.apiKey;
+
+let app, auth, db;
+if (!isMockEnabled) {
+  app = initializeApp(firebaseConfig);
+  auth = getAuth(app);
+  db = getFirestore(app);
+}
+
+// --- Mock Database (localStorage) ---
+const mockDb = {
+  getDoc: (path) => {
+    const data = localStorage.getItem(`aura_${path.join('/')}`);
+    return { exists: () => !!data, data: () => JSON.parse(data) };
+  },
+  setDoc: (path, data) => {
+    localStorage.setItem(`aura_${path.join('/')}`, JSON.stringify(data));
+  },
+  updateDoc: (path, data) => {
+    const existing = JSON.parse(localStorage.getItem(`aura_${path.join('/')}`) || '{}');
+    localStorage.setItem(`aura_${path.join('/')}`, JSON.stringify({ ...existing, ...data }));
+  },
+  getDocs: (path) => {
+    const keys = Object.keys(localStorage).filter(k => k.startsWith(`aura_${path.join('/')}`));
+    return { docs: keys.map(k => ({ id: k.split('/').pop(), data: () => JSON.parse(localStorage.getItem(k)) })) };
+  },
+  writeBatch: () => ({
+    set: (path, data) => mockDb.setDoc(path.path, data),
+    commit: async () => {}
+  })
+};
 
 // --- Utils ---
 const withRetry = async (fn, retries = 5, delay = 500) => {
@@ -97,8 +125,19 @@ export default function App() {
   const [historicalData, setHistoricalData] = useState([]); // For Analytics Month-to-Month
 
   useEffect(() => {
-    return onAuthStateChanged(auth, async (u) => {
-      if (u) { setUser(u); await syncData(u.uid); }
+    if (isMockEnabled) {
+      const savedUser = localStorage.getItem('aura_mock_user');
+      if (savedUser) {
+        const u = JSON.parse(savedUser);
+        setUser(u);
+        syncData(u.uid);
+      } else {
+        setLoading(false);
+      }
+      return;
+    }
+    return onAuthStateChanged(auth, (u) => {
+      if (u) { setUser(u); syncData(u.uid); }
       else { setUser(null); setLoading(false); }
     });
   }, []);
@@ -115,13 +154,20 @@ export default function App() {
 
   const syncData = async (uid) => {
     try {
-      const userRef = doc(db, 'artifacts', 'AuraStudy', 'users', uid);
-      const subjectsRef = collection(db, 'artifacts', 'AuraStudy', 'users', uid, 'subjects');
-      const tasksRef = collection(db, 'artifacts', 'AuraStudy', 'users', uid, 'tasks');
+      let userSnap, subjectsSnap, tasksSnap;
 
-      const [userSnap, subjectsSnap, tasksSnap] = await Promise.all([
-        getDoc(userRef), getDocs(subjectsRef), getDocs(tasksRef)
-      ]);
+      if (isMockEnabled) {
+        userSnap = mockDb.getDoc(['artifacts', 'AuraStudy', 'users', uid]);
+        subjectsSnap = mockDb.getDocs(['artifacts', 'AuraStudy', 'users', uid, 'subjects']);
+        tasksSnap = mockDb.getDocs(['artifacts', 'AuraStudy', 'users', uid, 'tasks']);
+      } else {
+        const userRef = doc(db, 'artifacts', 'AuraStudy', 'users', uid);
+        const subjectsRef = collection(db, 'artifacts', 'AuraStudy', 'users', uid, 'subjects');
+        const tasksRef = collection(db, 'artifacts', 'AuraStudy', 'users', uid, 'tasks');
+        [userSnap, subjectsSnap, tasksSnap] = await Promise.all([
+          getDoc(userRef), getDocs(subjectsRef), getDocs(tasksRef)
+        ]);
+      }
 
       if (userSnap.exists()) {
         const data = userSnap.data();
@@ -133,8 +179,12 @@ export default function App() {
         setSetupComplete(data.setupComplete || false);
         setTotalHours(data.totalHours || 8);
 
-        // Update Firebase with new streak/lastActive
-        updateDoc(userRef, { stats: updatedStats });
+        // Update data storage with new streak/lastActive
+        if (isMockEnabled) {
+          mockDb.updateDoc(['artifacts', 'AuraStudy', 'users', uid], { stats: updatedStats });
+        } else {
+          updateDoc(doc(db, 'artifacts', 'AuraStudy', 'users', uid), { stats: updatedStats });
+        }
       }
 
       setSubjects(subjectsSnap.docs.map(d => ({ id: d.id, ...d.data() })));
@@ -154,33 +204,50 @@ export default function App() {
     const studyMins = (totalHours * 60) * (studyBreakRatio / 100);
     const minsPerSubject = studyMins / selectedSubjectNames.length;
 
-    const batch = writeBatch(db);
     const initialSubjects = selectedSubjectNames.map(name => {
       const id = Math.random().toString(36).substr(2, 9);
       const def = DEFAULT_SUBJECTS.find(s => s.name === name) || { color: '#6366f1' };
-      const sub = { name, color: def.color, targetTime: Math.round(minsPerSubject), actualTime: 0, breakTime: 0, sessions: 0, resources: [], expenses: [], notes: '' };
-      batch.set(doc(db, 'artifacts', 'AuraStudy', 'users', user.uid, 'subjects', id), sub);
-      return { id, ...sub };
+      return { id, name, color: def.color, targetTime: Math.round(minsPerSubject), actualTime: 0, breakTime: 0, sessions: 0, resources: [], expenses: [], notes: '' };
     });
 
     const userData = { setupComplete: true, totalHours, stats: { xp: 0, level: 1, streak: 1, lastActive: new Date().toISOString() } };
-    batch.set(doc(db, 'artifacts', 'AuraStudy', 'users', user.uid), userData);
 
-    await batch.commit();
+    if (isMockEnabled) {
+      mockDb.setDoc(['artifacts', 'AuraStudy', 'users', user.uid], userData);
+      initialSubjects.forEach(sub => {
+        mockDb.setDoc(['artifacts', 'AuraStudy', 'users', user.uid, 'subjects', sub.id], sub);
+      });
+    } else {
+      const batch = writeBatch(db);
+      initialSubjects.forEach(sub => {
+        batch.set(doc(db, 'artifacts', 'AuraStudy', 'users', user.uid, 'subjects', sub.id), sub);
+      });
+      batch.set(doc(db, 'artifacts', 'AuraStudy', 'users', user.uid), userData);
+      await batch.commit();
+    }
+
     setSubjects(initialSubjects);
     setStats(userData.stats);
     setSetupComplete(true);
   };
 
   const saveSubject = async (sub) => {
-    const ref = doc(db, 'artifacts', 'AuraStudy', 'users', user.uid, 'subjects', sub.id);
-    await withRetry(() => updateDoc(ref, sub));
+    if (isMockEnabled) {
+      mockDb.updateDoc(['artifacts', 'AuraStudy', 'users', user.uid, 'subjects', sub.id], sub);
+    } else {
+      const ref = doc(db, 'artifacts', 'AuraStudy', 'users', user.uid, 'subjects', sub.id);
+      await withRetry(() => updateDoc(ref, sub));
+    }
     setSubjects(prev => prev.map(s => s.id === sub.id ? sub : s));
   };
 
   const saveTask = async (task) => {
-    const ref = doc(db, 'artifacts', 'AuraStudy', 'users', user.uid, 'tasks', task.id);
-    await withRetry(() => setDoc(ref, task));
+    if (isMockEnabled) {
+      mockDb.setDoc(['artifacts', 'AuraStudy', 'users', user.uid, 'tasks', task.id], task);
+    } else {
+      const ref = doc(db, 'artifacts', 'AuraStudy', 'users', user.uid, 'tasks', task.id);
+      await withRetry(() => setDoc(ref, task));
+    }
     setTasks(prev => {
       const exists = prev.find(t => t.id === task.id);
       return exists ? prev.map(t => t.id === task.id ? task : t) : [...prev, task];
@@ -191,7 +258,11 @@ export default function App() {
     setStats(prev => {
       const newXP = prev.xp + amount;
       const updated = { ...prev, xp: newXP, level: Math.floor(newXP / 1000) + 1 };
-      updateDoc(doc(db, 'artifacts', 'AuraStudy', 'users', user.uid), { stats: updated });
+      if (isMockEnabled) {
+        mockDb.updateDoc(['artifacts', 'AuraStudy', 'users', user.uid], { stats: updated });
+      } else {
+        updateDoc(doc(db, 'artifacts', 'AuraStudy', 'users', user.uid), { stats: updated });
+      }
       return updated;
     });
   };
@@ -244,7 +315,14 @@ function Sidebar({ activeTab, setActiveTab, stats, user }) {
           <div className="flex justify-between text-[10px] font-black uppercase text-indigo-400 mb-1"><span>Lvl {stats.level}</span><span>{stats.xp%1000}/1000 XP</span></div>
           <div className="h-1 bg-white/5 rounded-full overflow-hidden"><motion.div animate={{ width: `${(stats.xp%1000)/10}%` }} className="h-full bg-indigo-500" /></div>
         </div>
-        <Button variant="danger" className="w-full" icon={LogOut} onClick={() => signOut(auth)}>Sign Out</Button>
+        <Button variant="danger" className="w-full" icon={LogOut} onClick={() => {
+          if (isMockEnabled) {
+            localStorage.removeItem('aura_mock_user');
+            window.location.reload();
+          } else {
+            signOut(auth);
+          }
+        }}>Sign Out</Button>
       </div>
     </nav>
   );
@@ -502,26 +580,71 @@ function AuthScreen({ onAuth }) {
   const [e, setE] = useState('');
   const [p, setP] = useState('');
   const [err, setErr] = useState('');
+
   const handle = async (ev) => {
     ev.preventDefault(); setErr('');
+
+    if (isMockEnabled) {
+      const u = { uid: 'mock_user_123', email: e || 'demo@aurastudy.com' };
+      localStorage.setItem('aura_mock_user', JSON.stringify(u));
+      onAuth(u);
+      return;
+    }
+
+    if (!e || !p) {
+      setErr('Please enter both email and password.');
+      return;
+    }
+
     try {
       const u = l ? await signInWithEmailAndPassword(auth, e, p) : await createUserWithEmailAndPassword(auth, e, p);
       onAuth(u.user);
-    } catch (err) { setErr(err.message); }
+    } catch (err) {
+      console.error("Auth Error:", err.code, err.message);
+      const messages = {
+        'auth/invalid-email': 'Invalid email address format.',
+        'auth/user-disabled': 'This user account has been disabled.',
+        'auth/user-not-found': 'No user found with this email.',
+        'auth/wrong-password': 'Incorrect password. Please try again.',
+        'auth/email-already-in-use': 'This email is already registered.',
+        'auth/weak-password': 'Password should be at least 6 characters.',
+        'auth/operation-not-allowed': 'Auth provider not enabled in Firebase.',
+        'auth/api-key-not-valid': 'Invalid Firebase API Key. Use Demo Mode instead.'
+      };
+      setErr(messages[err.code] || err.message.replace('Firebase:', '').trim());
+    }
   };
+
   return (
     <div className="min-h-screen bg-[#0b0f1a] flex items-center justify-center p-6 bg-gradient-to-br from-indigo-950 via-slate-950 to-purple-950">
       <GlassCard className="max-w-md w-full !bg-white/5">
         <div className="flex justify-center mb-8"><div className="w-16 h-16 bg-indigo-600 rounded-3xl flex items-center justify-center text-white"><Zap size={32} fill="currentColor"/></div></div>
         <h2 className="text-3xl font-black text-center mb-2 tracking-tighter">AuraStudy</h2>
-        <p className="text-center opacity-50 text-sm mb-10 font-bold">Premium Aura Workspace</p>
+        <p className="text-center opacity-50 text-sm mb-10 font-bold">{isMockEnabled ? "Demo Mode Active" : "Premium Aura Workspace"}</p>
         <form onSubmit={handle} className="space-y-4">
           <input value={e} onChange={ev=>setE(ev.target.value)} placeholder="Email" className="w-full bg-white/5 border border-white/10 rounded-2xl px-6 py-4 outline-none focus:border-indigo-600 transition-all"/>
           <input type="password" value={p} onChange={ev=>setP(ev.target.value)} placeholder="Password" className="w-full bg-white/5 border border-white/10 rounded-2xl px-6 py-4 outline-none focus:border-indigo-600 transition-all"/>
-          {err && <p className="text-red-400 text-xs text-center font-bold">{err}</p>}
-          <Button type="submit" className="w-full py-4 text-lg">{l?'Login':'Create Aura'}</Button>
+
+          {err && (
+            <div className="p-4 bg-red-500/10 border border-red-500/20 rounded-2xl">
+              <p className="text-red-400 text-xs text-center font-bold">{err}</p>
+            </div>
+          )}
+
+          <Button type="submit" className="w-full py-4 text-lg">
+            {isMockEnabled ? "Launch Demo" : (l ? 'Login' : 'Create Aura')}
+          </Button>
         </form>
-        <button onClick={()=>setL(!l)} className="w-full mt-6 text-xs text-slate-500 font-bold hover:text-white transition-colors">{l?"New here? Create account":"Back to login"}</button>
+        {!isMockEnabled && (
+          <button onClick={()=>setL(!l)} className="w-full mt-6 text-xs text-slate-500 font-bold hover:text-white transition-colors">
+            {l?"New here? Create account":"Back to login"}
+          </button>
+        )}
+        {isMockEnabled && (
+          <p className="mt-6 text-[10px] text-center text-slate-500 font-bold uppercase tracking-widest">
+            Data will be saved locally in your browser
+          </p>
+        )}
       </GlassCard>
     </div>
   );
